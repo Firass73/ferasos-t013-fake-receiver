@@ -80,6 +80,48 @@ class ReceiverTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "Refuse key rotation"):
             server.TestReceiver(Path(self.temp.name))
 
+    def test_nonce_mutation_in_journal_is_detected(self):
+        self.assertEqual(self.submit(self.envelope())[0], 503)
+        obj = server.strict_loads(self.state.journal_path.read_bytes())
+        obj["journal"]["nonce"] = "f" * 32
+        self.state.journal_path.write_bytes(server.json_bytes(obj))
+        self.assertEqual(self.state.readback()["invalidJournal"], True)
+        status, response = self.submit(self.envelope())
+        self.assertEqual(status, 409)
+        self.assertNotIn("signature", response)
+
+    def test_self_consistent_nonce_mutation_without_valid_client_signature_is_detected(self):
+        self.assertEqual(self.submit(self.envelope())[0], 503)
+        obj = server.strict_loads(self.state.journal_path.read_bytes())
+        obj["journal"]["nonce"] = "f" * 32
+        obj["senderAuthorization"]["body"]["nonce"] = "f" * 32
+        self.state.journal_path.write_bytes(server.json_bytes(obj))
+        self.assertEqual(self.state.readback()["invalidJournal"], True)
+        self.assertEqual(self.submit(self.envelope())[0], 409)
+
+    def test_signed_authorization_missing_is_detected(self):
+        self.assertEqual(self.submit(self.envelope())[0], 503)
+        obj = server.strict_loads(self.state.journal_path.read_bytes())
+        del obj["senderAuthorization"]
+        self.state.journal_path.write_bytes(server.json_bytes(obj))
+        self.assertEqual(self.state.readback()["invalidJournal"], True)
+        self.assertEqual(self.submit(self.envelope())[0], 409)
+
+    def test_old_v1_unattested_journal_fails_closed(self):
+        self.assertEqual(self.submit(self.envelope())[0], 503)
+        self.state.journal_path.write_bytes(server.json_bytes(self.state.expected_journal(self.nonce)))
+        state = server.TestReceiver(Path(self.temp.name))
+        self.assertEqual(state.readback()["invalidJournal"], True)
+        self.assertEqual(state.receive(self.envelope())[0], 409)
+
+    def test_journal_tampered_digest_even_when_sender_signature_valid_is_detected(self):
+        self.assertEqual(self.submit(self.envelope())[0], 503)
+        obj = server.strict_loads(self.state.journal_path.read_bytes())
+        obj["journal"]["recordDigest"] = "0" * 64
+        self.state.journal_path.write_bytes(server.json_bytes(obj))
+        self.assertEqual(self.state.readback()["invalidJournal"], True)
+        self.assertEqual(self.submit(self.envelope())[0], 409)
+
     def test_http_handler_real_local_transport(self):
         httpd = HTTPServer(("127.0.0.1", 0), server.make_handler(self.state))
         thread = threading.Thread(target=httpd.serve_forever, daemon=True)
