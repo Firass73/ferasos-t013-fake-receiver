@@ -99,19 +99,42 @@ class TestReceiver:
                 "recordCount": 2, "commits": 1, "archiveStatus": ACK_STATUS,
                 "productionApproved": False}
 
+    def _validate_signed_test_request(self, package):
+        """The client Ed25519 signature, not disk-provided nonce, is the anchor.
+
+        Only two whitelisted synthetic messages are valid. An old journal
+        without its authenticated request is intentionally invalid, not migrated.
+        """
+        if type(package) is not dict or list(package) != ["body", "clientSignature"]:
+            raise ValueError("Malformed signed request on journal disk")
+        request = package["body"]
+        if type(request) is not dict or list(request) != ["type", "batch", "nonce", "records", "testOnly", "productionApproved"]:
+            raise ValueError("Invalid signed test body")
+        if (request["type"] != "T013_CLIENT_FAKE_REQUEST_V1" or request["batch"] != BATCH or
+                type(request["nonce"]) is not str or not re.fullmatch(r"[0-9a-f]{32}", request["nonce"]) or
+                request["records"] != RECORDS or request["testOnly"] is not True or
+                request["productionApproved"] is not False or type(package["clientSignature"]) is not str):
+            raise ValueError("Non-test or out-of-scope signed request")
+        self.client_public.verify(base64.b64decode(package["clientSignature"], validate=True), json_bytes(request))
+        return request["nonce"]
+
     def readback(self):
         if not self.journal_path.exists():
             return {"committed": False, "scope": "FAKE_ONLY_EPHEMERAL_NOT_PRODUCTION"}
         try:
-            value = strict_loads(self.journal_path.read_bytes())
-            nonce = value.get("nonce") if type(value) is dict else None
+            envelope = strict_loads(self.journal_path.read_bytes())
+            if type(envelope) is not dict or list(envelope) != ["journal", "senderAuthorization"]:
+                raise ValueError("Missing journal-authenticating sender envelope")
+            nonce = self._validate_signed_test_request(envelope["senderAuthorization"])
+            value = envelope["journal"]
             expected = self.expected_journal(nonce)
-            if type(nonce) is not str or not re.fullmatch(r"[0-9a-f]{32}", nonce):
-                raise ValueError("Invalid nonce")
-            if set(value) != set(expected) or any(type(value[k]) is not type(v) or value[k] != v for k, v in expected.items()):
-                raise ValueError("Journal content mismatch")
+            if type(value) is not dict or set(value) != set(expected) or any(
+                    type(value[k]) is not type(v) or value[k] != v for k, v in expected.items()):
+                raise ValueError("Journal content differs from authenticated sender request")
             return {"committed": True, "journal": value, "scope": "FAKE_ONLY_EPHEMERAL_NOT_PRODUCTION"}
-        except (OSError, ValueError, TypeError):
+        except Exception:
+            # Fail closed on malformed disk state, including invalid Ed25519 signatures.
+            # Never emit a signed acknowledgment after invalid/legacy state.
             return {"committed": False, "invalidJournal": True, "scope": "FAKE_ONLY_EPHEMERAL_NOT_PRODUCTION"}
 
     def receive(self, raw):
@@ -147,7 +170,10 @@ class TestReceiver:
         else:
             if self.first_loss_path.exists():
                 return 409, {"error": "prior_commit_missing"}
-            exclusive_durable(self.journal_path, json_bytes(expected))
+            # One fsynced JSON journal binds nonce to its verified, signed client
+            # request. This avoids two-file torn-commit ambiguity.
+            durable_payload = {"journal": expected, "senderAuthorization": package}
+            exclusive_durable(self.journal_path, json_bytes(durable_payload))
         # Deliberate 503 AFTER journal fsync, to exercise retry without false ACK.
         if not self.first_loss_path.exists():
             exclusive_durable(self.first_loss_path, json_bytes({"firstReplyLostAfterCommit": True}))
